@@ -1,0 +1,167 @@
+name: RDP-Permanent
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */8 * * *'  # هەموو ٨ کاتژمێر جارێک
+
+jobs:
+  maintain-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 480  # ٨ کاتژمێر
+    steps:
+      - name: Check Existing RDP
+        run: |
+          # پشکنین ئەگەر RDP پێشتر ڕێکخراوە
+          $rdpEnabled = (Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue).fDenyTSConnections
+          $userExists = Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
+          
+          if ($rdpEnabled -eq 0 -and $userExists) {
+              Write-Host "✅ RDP already configured - reusing existing setup"
+              echo "REUSING_EXISTING=true" >> $env:GITHUB_ENV
+          } else {
+              Write-Host "🔄 Setting up new RDP configuration"
+              echo "REUSING_EXISTING=false" >> $env:GITHUB_ENV
+          }
+
+      - name: Setup RDP (Only if needed)
+        if: env.REUSING_EXISTING == 'false'
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          
+          $password = "RDP@" + (Get-Date -Format "MMdd") + "!GitHub"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          if (Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDPUser"
+          }
+          
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+          
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ New RDP configuration created"
+
+      - name: Reuse Existing Password
+        if: env.REUSING_EXISTING == 'true'
+        run: |
+          # هەر وەک پێشوو پاسوۆردەکە بهێڵەرەوە
+          $password = "RDP@" + (Get-Date -Format "MMdd") + "!GitHub"
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ Using existing RDP configuration"
+
+      - name: Maintain Tailscale Connection
+        run: |
+          # پشکنین ئەگەر تیلسکەیل پێشتر دامەزراوە
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              Write-Host "✅ Tailscale already installed"
+              
+              # پشکنینی پەیوەندی ئێستا
+              $currentStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              if ($currentStatus.BackendState -eq "Running") {
+                  Write-Host "✅ Tailscale already connected"
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+              } else {
+                  Write-Host "🔄 Reconnecting Tailscale..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-rdp-permanent
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+              }
+          } else {
+              Write-Host "📥 Installing Tailscale for the first time..."
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+              $installerPath = "$env:TEMP\tailscale.msi"
+              
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait -NoNewWindow
+              Remove-Item $installerPath -Force
+              
+              Start-Sleep -Seconds 15
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-rdp-permanent
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          }
+
+      - name: Display Permanent Connection Info
+        run: |
+          Write-Host "🎯 PERMANENT RDP CONNECTION"
+          Write-Host "============================"
+          Write-Host "🌟 This is YOUR persistent RDP"
+          Write-Host "🔗 IP: $env:TAILSCALE_IP"
+          Write-Host "👤 User: RDPUser"
+          Write-Host "🔐 Password: $env:RDP_PASSWORD"
+          Write-Host "⏰ Duration: 30 DAYS"
+          Write-Host "🔄 Auto-maintained every 8 hours"
+          Write-Host "============================"
+          
+          # نووسینی زانیاری هەمیشەیی
+          $permanentInfo = @"
+YOUR PERMANENT RDP - 30 DAYS
+=============================
+This is your personal RDP connection that will
+be maintained for 30 days without changes.
+
+CONNECTION DETAILS:
+IP: $env:TAILSCALE_IP
+Username: RDPUser
+Password: $env:RDP_PASSWORD
+
+SETUP DATE: $(Get-Date)
+EXPIRES: $((Get-Date).AddDays(30))
+
+Note: This connection auto-restarts every 8 hours
+but keeps the SAME IP and credentials.
+"@
+          $permanentInfo | Out-File -FilePath "C:\My_Permanent_RDP.txt" -Encoding UTF8
+
+      - name: Maintain Permanent Session
+        run: |
+          $startTime = Get-Date
+          $totalDuration = 30 # ڕۆژ
+          $sessionEnd = $startTime.AddMinutes(470) # ٧ کاتژمێر و ٥٠ خولەک
+          
+          Write-Host "🔒 MAINTAINING YOUR PERMANENT RDP"
+          Write-Host "=================================="
+          Write-Host "📅 Started: $startTime"
+          Write-Host "⏰ Will maintain until: $($startTime.AddDays($totalDuration))"
+          Write-Host "🔗 Your IP: $env:TAILSCALE_IP"
+          Write-Host "=================================="
+          
+          $permanentIP = $env:TAILSCALE_IP
+          
+          while ((Get-Date) -lt $sessionEnd) {
+              $currentTime = Get-Date
+              $elapsed = $currentTime - $startTime
+              $daysElapsed = [math]::Round($elapsed.TotalDays, 2)
+              $daysRemaining = $totalDuration - $daysElapsed
+              
+              # پشکنینی پەیوەندی هەمیشەیی
+              try {
+                  # پشکنینی تیلسکەیل
+                  $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                  if ($currentIP -ne $permanentIP) {
+                      Write-Host "🔄 IP changed from $permanentIP to $currentIP"
+                      $permanentIP = $currentIP
+                      echo "TAILSCALE_IP=$currentIP" >> $env:GITHUB_ENV
+                  }
+                  
+                  # پشکنینی RDP
+                  $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+                  if ($rdpService.Status -ne 'Running') {
+                      Write-Host "🔄 Restarting RDP service to maintain your connection..."
+                      Start-Service -Name "TermService"
+                  }
+                  
+                  Write-Host "[$currentTime] 🔒 YOUR RDP - Day $daysElapsed/$totalDuration - $daysRemaining days left - IP: $permanentIP"
+                  
+              } catch {
+                  Write-Host "⚠️ Maintenance check: $($_.Message)"
+              }
+              
+              Start-Sleep -Seconds 300  # ٥ خولەک
+          }
+          
+          Write-Host "🔄 Your RDP will auto-restart in 10 minutes..."
